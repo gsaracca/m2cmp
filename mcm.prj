@@ -1,0 +1,20 @@
+
++M2EXTENSIONS
++M2ADDTYPES
+-IOVERFLOW
+-COVERFLOW
+-CHECKINDEX
+-CHECKRANGE
+-CHECKNIL
+-GENDEBUG
+-LINENO
+-GENHISTORY
+
+-multithread+
+
+-GUI:+
+-MINCPU = PentiumPro
+-ALIGNMENT = 8
+-CPU = PentiumPro
+!module D:\Source\m2cmp\MCLIST.MOD
+!module D:\Source\m2cmp\MCP3MAIN.MOD

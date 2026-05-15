@@ -1,0 +1,63 @@
+(*
+
+        GS-M2 v.0.0.1
+        BNF
+
+*)
+Unit ::=       "module" Module "end".
+Module ::=     Ident { Import } Block.
+Import ::=     "import" IdentList | "from" Ident "import" IdentList .
+IdentList ::=  Ident { "," Ident } .
+Block ::=      { Definition } [ "begin" StatSequence ] "end".
+Definition ::=
+            | "const" { Ident "=" Constant ";" }
+            | "type" { Ident "=" type ";" }
+            | "var" { Ident {"," Ident } ":" Type ";" }
+            | "procedure" Ident ( SymProcNum "procedure" FormalTypeList | [ FormalParList ] [ Block | CodeBlock ] ).
+QualIdent =  Ident { "." Ident } .
+SetConstr =  "{" { Element } "}" .
+Element =    Constant [ ".." Constant ] .
+TypeDecl =   Ident Type .
+Type =       SimpleType |
+             "array" { SimpleType } "of" Type |
+             "record" { FieldList } "end" [ SymSize ] |
+             "set of" SimpleType |
+             "pointer to" Type |
+             "procedure" [ FormalTypeList ] .
+SimpleType = QualIdent | Subrange | Enumeration.
+Subrange =   "[" Constant ".." Constant "]" .
+Enumeration = "(" { Ident [ SymValue ] } ")" .
+FieldList =  { Ident } ":" Type |
+             "case" [ Ident ] ":" QualIdent
+               { "of" { Element | SymVarVal } ":"
+                 { FieldList } [ SymSize ] }
+               [ "else" { FieldList } [ SymSize ] ] "end" .
+FormalTypeList = "(" { [ "var" ] FormalType } ")" [ ":" QualIdent ] .
+FormalType = [ "array of" ] QualIdent .
+FormalParList = "(" { [ "var" ] { Ident } ":" FormalType } ")" [ ":" QualIdent ] .
+CodeBlock =  { Constant } "end".
+StatSequence = { Statement } .
+Statement ::=
+            Designator ":=" Expression |
+            Designator ParamList |
+            "if" Expression StatSequence { "elsif" Expression StatSequence } [ "else" Expression StatSequence ] "end" |
+            "with" Designator StatSequence "end" |
+            "case" Expression { "of" { Element } ":" StatSequence } [ "else" StatSequence ] "end" |
+            "loop" StatSequence "end" |
+            "while" Expression StatSequence "end" |
+            "repeat" StatSequence "until" Expression |
+            "for" Ident "," Expression "to" Expression [ "by" Constant ] StatSequence "end" |
+            "return" [ "(" Expression ")" ] |
+            "exit".
+Expression = SimpleExpr [ RelOp SimpleExpr ] .
+RelOp =      "=" | "<>" | ">" | ">=" | "<" | "<=" | "in" .
+SimpleExpr = [ "+" | "-" ] Term { AddOp Term } .
+AddOp =      "+" | "-" | "or" .
+Term =       Factor { MulOp Factor } .
+MulOp =      "*" | "/" | "div" | "mod" | "and" .
+Factor =      integer | cardinal | char | real | string | SetConstr | 
+              Designator [ ParamList | SetConstr ] |
+              "not" Factor |
+              "(" Expression ")" .
+Designator = QualIdent { "[" Expression "]" | "." Ident | "^" }.
+ParamList =  "(" [ Expression { "," Expression } ]
