@@ -164,6 +164,7 @@ static Stptr g_realptr,  g_wordptr, g_addrptr;
 
 static FILE*    ll_out   = NULL;
 static FILE*    il1_in   = NULL;
+static FILE*    asc_in   = NULL;   /* ASCII spelling table (Pass 1 output) */
 
 static uint32_t reg_ctr  = 0;   /* SSA register counter    %t.N  */
 static uint32_t lbl_ctr  = 0;   /* basic-block label counter L.N  */
@@ -339,30 +340,59 @@ static uint32_t type_bytes(Stptr sp) {
 }
 
 /* =========================================================================
- * 5.  NAME MANGLER
+ * 5.  SPELLING TABLE + NAME MANGLER
  *
- *  Produces valid LLVM IR identifiers:
- *    @M2_ModName__ProcName     global (procedure or module variable)
- *    %v_VarName                local alloca inside a function
+ * ASC file format (written by MCP1IO IdentSystem):
+ *   Identifiers are written sequentially as raw characters, each terminated
+ *   by a space (' ').  Spellix (= ip->name) is the byte offset in the file
+ *   where the spelling begins.  Read chars until space to obtain the name.
+ *
+ * LLVM IR identifiers produced:
+ *    @M2_ModName__ProcName_N   global procedure (N = procnum disambiguator)
+ *    @M2_ModName__VarName      global variable
+ *    %v_VarName_N              local alloca  (N = vaddr disambiguator)
  *    @M2_str_N                 string literal constant
  * ========================================================================= */
+
+static void spell_lookup(uint32_t spix, char* buf, size_t n) {
+    if (!asc_in || spix == 0 || n == 0) { snprintf(buf, n, "s%u", spix); return; }
+    if (fseek(asc_in, (long)spix, SEEK_SET) != 0) { snprintf(buf, n, "s%u", spix); return; }
+    size_t i = 0;
+    int c;
+    while (i + 1 < n && (c = fgetc(asc_in)) != EOF && c != ' ')
+        buf[i++] = (char)c;
+    buf[i] = '\0';
+    /* Sanitize: replace chars that are illegal in unquoted LLVM identifiers */
+    for (char* p = buf; *p; p++)
+        if (*p == '-' || *p == '.' || *p == ' ') *p = '_';
+}
 
 static void mangle_module_var(const char* modname, const char* varname,
                                char* buf, size_t n) {
     snprintf(buf, n, "@M2_%s__%s", modname, varname);
 }
 
+/* Resolve Idptr to its source name and emit a global variable reference */
+static void mangle_var_id(Idptr ip, char* buf, size_t n) {
+    char modname[64] = "anon", varname[64] = "v";
+    if (ip->globmodp) spell_lookup(ip->globmodp->name, modname, sizeof modname);
+    if (ip->name)     spell_lookup(ip->name,           varname, sizeof varname);
+    mangle_module_var(modname, varname, buf, n);
+}
+
 static void mangle_proc(Idptr ip, char* buf, size_t n) {
-    const char* mod = (ip->globmodp && ip->proc.globalmodule)
-                      ? ip->globmodp->proc.identifier
-                      : "anon";
-    /* Use procnum as a stable disambiguator for nested procedures */
-    snprintf(buf, n, "@M2_%s__p%u", mod, ip->proc.procnum);
+    char modname[64] = "anon", procname[64] = "p";
+    if (ip->globmodp) spell_lookup(ip->globmodp->name, modname,  sizeof modname);
+    if (ip->name)     spell_lookup(ip->name,           procname, sizeof procname);
+    /* Append procnum so nested procs with the same name stay unique */
+    snprintf(buf, n, "@M2_%s__%s_%u", modname, procname, ip->proc.procnum);
 }
 
 static void mangle_local_var(Idptr ip, char* buf, size_t n) {
-    /* vaddr used as unique slot within frame */
-    snprintf(buf, n, "%%v_%u", ip->var.vaddr);
+    char varname[64] = "v";
+    if (ip->name) spell_lookup(ip->name, varname, sizeof varname);
+    /* Append vaddr to keep names unique across nested scopes */
+    snprintf(buf, n, "%%v_%s_%u", varname, ip->var.vaddr);
 }
 
 static void mangle_string(uint32_t idx, char* buf, size_t n) {
@@ -620,23 +650,16 @@ static Attr attr_from_id(Idptr ip, uint32_t cur_level) {
         switch (ip->var.state) {
             case global:
                 a.mode = ATTR_GLOBAL;
-                mangle_module_var(ip->globmodp
-                                  ? ip->globmodp->proc.identifier
-                                  : "anon",
-                                  /* name lookup via spelling table omitted */
-                                  "v", a.reg, sizeof a.reg);
+                mangle_var_id(ip, a.reg, sizeof a.reg);
                 break;
             case local:
                 a.mode = ATTR_LOCAL;
                 mangle_local_var(ip, a.reg, sizeof a.reg);
                 break;
             case separate:
-                /* External module variable — treat as global for now */
+                /* External module variable — treat as global */
                 a.mode = ATTR_GLOBAL;
-                mangle_module_var(ip->globmodp
-                                  ? ip->globmodp->proc.identifier
-                                  : "ext",
-                                  "v", a.reg, sizeof a.reg);
+                mangle_var_id(ip, a.reg, sizeof a.reg);
                 break;
             case absolute:
                 /* Absolute address (SYSTEM usage) — emit as inttoptr */
@@ -768,7 +791,60 @@ static void emit_runtime_decls(void) {
 }
 
 /* =========================================================================
- * 10.  FORWARD DECLARATIONS  (mutual recursion between expr and stmt)
+ * 10.  WITH SYSTEM   (mirrors MCP4EXPR.MOD WithSystem)
+ *
+ * WITH rec DO body END:
+ *   Pass 3 emits a 'field' symbol (val = with-depth) before each field
+ *   reference inside the WITH scope.  val=1 → outermost active WITH.
+ *
+ * We store each record's base address in a dedicated ptr alloca so it
+ * survives through all nested statements without re-evaluating the base.
+ * ========================================================================= */
+
+#define WITH_MAX 8
+typedef struct {
+    char  base_alloca[64]; /* alloca ptr holding the record base address */
+    Stptr rec_type;        /* Structrec of the record                    */
+} WithEntry;
+
+static WithEntry with_stack[WITH_MAX];
+static int       with_depth = 0;
+
+static void enter_with(Attr rec_attr) {
+    assert(with_depth < WITH_MAX);
+    /* Emit a ptr alloca in the *current* position (not entry block) so it
+       is visible to the body.  Alloca in LLVM dominates all successors. */
+    char slot[64]; snprintf(slot, sizeof slot, "%%with_%d", with_depth);
+    fprintf(ll_out, "  %s = alloca ptr\n", slot);
+    char base[64]; addr_of(rec_attr, base, sizeof base);
+    ir("store ptr %s, ptr %s", base, slot);
+    with_stack[with_depth].rec_type = rec_attr.type;
+    strncpy(with_stack[with_depth].base_alloca, slot,
+            sizeof with_stack[0].base_alloca - 1);
+    with_depth++;
+}
+
+static void exit_with(void) {
+    assert(with_depth > 0);
+    with_depth--;
+}
+
+/* Return an Attr for the base of WITH level depth_val (1 = outermost). */
+static Attr use_with(int32_t depth_val) {
+    assert(depth_val >= 1 && depth_val <= with_depth);
+    WithEntry* e = &with_stack[depth_val - 1];
+    char ptr_reg[64]; new_reg(ptr_reg, sizeof ptr_reg);
+    ir("%s = load ptr, ptr %s", ptr_reg, e->base_alloca);
+    Attr a; memset(&a, 0, sizeof a);
+    a.mode     = ATTR_PTREG;
+    a.type     = e->rec_type;
+    a.byte_off = 0;
+    strncpy(a.reg, ptr_reg, sizeof a.reg - 1);
+    return a;
+}
+
+/* =========================================================================
+ * 10b.  FORWARD DECLARATIONS  (mutual recursion between expr and stmt)
  * ========================================================================= */
 
 static Attr expression(void);
@@ -1219,10 +1295,13 @@ static Attr expression(void) {
 static Attr designator(void) {
     Attr a = {0};
     if (sy == namesy) {
-        a = attr_from_id(nptr, 0 /* TODO: cur_level */);
+        a = attr_from_id(nptr, 0 /* cur_level unused: single-process port */);
         get_symbol();
-    } else { /* sy == field (WITH statement record field) */
-        /* TODO: WITH statement field access */
+    } else {
+        /* sy == field: WITH-statement field access.
+           val = WITH depth (1 = outermost active WITH scope in this block).
+           Pass 3 resolves which WITH scope owns this field and records it. */
+        a = use_with(val);
         get_symbol();
     }
 
@@ -1232,13 +1311,15 @@ static Attr designator(void) {
             get_symbol();
             Stptr arr_type = a.type;
             Attr idx = load_attr(expression());
-            /* Adjust for base index */
+            /* Adjust for non-zero lower bound: effective_idx = raw_idx - lo */
             uint32_t lo = arr_type->arr.ixp->sr.min;
             if (lo != 0) {
+                idx = load_attr(idx);
                 char ibuf[64]; attr_value_str(idx, ibuf, sizeof ibuf);
                 char adj[64]; new_reg(adj, sizeof adj);
-                ir_binop(adj, "sub", g_cardptr, ibuf, /* lo as string */ ibuf);
-                /* TODO: proper lo constant */
+                char lo_str[32]; snprintf(lo_str, sizeof lo_str, "%u", lo);
+                ir_binop(adj, "sub", g_cardptr, ibuf, lo_str);
+                idx.mode = ATTR_REG;
                 strncpy(idx.reg, adj, sizeof idx.reg - 1);
             }
             char base[64]; addr_of(a, base, sizeof base);
@@ -1257,16 +1338,24 @@ static Attr designator(void) {
             a.mode    = ATTR_PTREG;
             a.type    = a.type ? a.type->ptr.elemp : NULL;
             a.byte_off = 0;
-        } else { /* period → record field */
+        } else { /* period → record field selection */
             get_symbol();
             assert(sy == namesy && nptr->klass == fields);
             Idptr fp = nptr;
             char base[64]; addr_of(a, base, sizeof base);
-            /* TODO: compute field index by walking record field list */
-            char gep[64]; new_reg(gep, sizeof gep);
-            ir_gep_field(gep, a.type, base, 0 /* field index TODO */);
-            a.mode    = ATTR_PTREG;
-            a.type    = fp->idtyp;
+            /* fldaddr is the Lilith word offset (1 word = 2 bytes).
+               Byte-offset GEP handles fixed and variant record parts
+               without needing to enumerate struct field indices. */
+            int32_t byte_off = (int32_t)(fp->fldaddr) * 2;
+            char gep[64];
+            if (byte_off == 0) {
+                strncpy(gep, base, sizeof gep - 1);
+            } else {
+                new_reg(gep, sizeof gep);
+                ir("%s = getelementptr i8, ptr %s, i32 %d", gep, base, byte_off);
+            }
+            a.mode     = ATTR_PTREG;
+            a.type     = fp->idtyp;
             a.byte_off = 0;
             strncpy(a.reg, gep, sizeof a.reg - 1);
             get_symbol();
@@ -1400,9 +1489,10 @@ static void emit_for(void) {
 
     ir_label(body_lbl);
     stat_seq(endsy);
-    /* Increment control variable */
+    /* Increment (or decrement) control variable by the actual step value */
     char inc[64]; new_reg(inc, sizeof inc);
-    ir_binop(inc, "add", ctrl.type, cur, step > 0 ? "1" : "-1"); /* TODO: |step| */
+    char step_str[32]; snprintf(step_str, sizeof step_str, "%d", step);
+    ir_binop(inc, "add", ctrl.type, cur, step_str);
     ir_store(ctrl.type, inc, ctrl_ptr);
     if (!unreachable) ir_br(cond_lbl);
 
@@ -1513,12 +1603,15 @@ static void emit_case(void) {
 
 static void emit_with(void) {
     /* WITH rec DO body END
-       Evaluate record address, make it available to field designators */
-    /* TODO: push with-record onto with-stack (mirrors MCP4EXPR WithSystem) */
+       1. Evaluate the record designator to get its base address.
+       2. Push onto the with-stack (stores base in a ptr alloca).
+       3. Process the body — 'field' tokens inside will call use_with().
+       4. Pop the with-stack on exit. */
     Attr rec = designator();
-    (void)rec;
+    enter_with(rec);
     stat_seq(endsy);
     get_symbol(); /* endsy */
+    exit_with();
 }
 
 static void emit_return(void) {
@@ -1632,17 +1725,22 @@ static void emit_module_globals(Idptr mod) {
  * ========================================================================= */
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: mcp4llvm <il1-file> <output.ll>\n");
-        fprintf(stderr, "\nReads IL1 binary (Pass 3 output) and emits LLVM IR text.\n");
+    if (argc < 4) {
+        fprintf(stderr, "usage: mcp4llvm <il1-file> <asc-file> <output.ll>\n");
+        fprintf(stderr, "  il1-file  IL1 binary from Pass 3\n");
+        fprintf(stderr, "  asc-file  ASCII spelling table from Pass 1\n");
+        fprintf(stderr, "  output    LLVM IR text (.ll)\n");
         return 1;
     }
 
     il1_in = fopen(argv[1], "rb");
     if (!il1_in) { perror(argv[1]); return 1; }
 
-    ll_out = fopen(argv[2], "w");
-    if (!ll_out) { perror(argv[2]); fclose(il1_in); return 1; }
+    asc_in = fopen(argv[2], "rb");
+    if (!asc_in) { perror(argv[2]); fclose(il1_in); return 1; }
+
+    ll_out = fopen(argv[3], "w");
+    if (!ll_out) { perror(argv[3]); fclose(il1_in); fclose(asc_in); return 1; }
 
     /* Target triple for current host (adjust for cross-compilation) */
     fprintf(ll_out, "; ModuleID = 'modula2'\n");
