@@ -787,6 +787,7 @@ static void emit_runtime_decls(void) {
     fprintf(ll_out, "declare void @M2_Inc(ptr, i32)\n");
     fprintf(ll_out, "declare void @M2_Dec(ptr, i32)\n");
     fprintf(ll_out, "declare void @M2_Trap(i32)\n");
+    fprintf(ll_out, "declare void @M2_Transfer(ptr, ptr)\n");
     fprintf(ll_out, "\n");
 }
 
@@ -919,8 +920,44 @@ static Attr call_standard_pure(Stpures pname, Attr proc_a) {
             ir_call_void("@M2_Dispose", args);
             break;
         }
+        case exlp: {
+            /* EXCL(s, e): s := s AND NOT (1 << e) */
+            get_symbol(); Attr s_a = expression();
+            char s_ptr[64]; addr_of(s_a, s_ptr, sizeof s_ptr);
+            get_symbol(); /* comma */
+            Attr e_a = load_attr(expression());
+            char ebuf[64]; attr_value_str(e_a, ebuf, sizeof ebuf);
+            char s_v[64]; new_reg(s_v, sizeof s_v);
+            ir_load(s_v, s_a.type, s_ptr);
+            char bit[64], notb[64], res[64];
+            new_reg(bit, sizeof bit); new_reg(notb, sizeof notb); new_reg(res, sizeof res);
+            ir("%s = shl i32 1, %s",        bit,  ebuf);
+            ir("%s = xor i32 %s, -1",       notb, bit);
+            ir_binop(res, "and", s_a.type ? s_a.type : g_cardptr, s_v, notb);
+            ir_store(s_a.type, res, s_ptr);
+            break;
+        }
+        case inlp: {
+            /* INCL(s, e): s := s OR (1 << e) */
+            get_symbol(); Attr s_a = expression();
+            char s_ptr[64]; addr_of(s_a, s_ptr, sizeof s_ptr);
+            get_symbol(); /* comma */
+            Attr e_a = load_attr(expression());
+            char ebuf[64]; attr_value_str(e_a, ebuf, sizeof ebuf);
+            char s_v[64]; new_reg(s_v, sizeof s_v);
+            ir_load(s_v, s_a.type, s_ptr);
+            char bit[64], res[64];
+            new_reg(bit, sizeof bit); new_reg(res, sizeof res);
+            ir("%s = shl i32 1, %s", bit, ebuf);
+            ir_binop(res, "or", s_a.type ? s_a.type : g_cardptr, s_v, bit);
+            ir_store(s_a.type, res, s_ptr);
+            break;
+        }
+        case trsp:
+            /* TRANSFER(VAR p1, p2: PROCESS): coroutine switch — runtime call */
+            ir_call_void("@M2_Transfer", ""); /* arguments skipped for now */
+            break;
         default:
-            /* TODO: trsp (TRANSFER/IOTRANSFER), exlp (EXCL), inlp (INCL) */
             break;
     }
     return result;
@@ -929,35 +966,106 @@ static Attr call_standard_pure(Stpures pname, Attr proc_a) {
 static Attr call_standard_func(Stfuncs fname, Attr proc_a) {
     (void)proc_a;
     Attr result = {0};
-    get_symbol(); /* skip lparent already consumed by caller */
+
+    /* ADR, HIGH, SIZE need the unloaded designator (address/type) */
+    if (fname == adrf || fname == higf || fname == sizf) {
+        get_symbol(); /* consume lparent */
+        Attr raw = expression(); /* NOT load_attr — keep as lvalue */
+        char dst[64]; new_reg(dst, sizeof dst);
+        switch (fname) {
+            case adrf: {
+                /* ADR(v): address of v as INTEGER (ADDRESS subrange) */
+                char ptr[64]; addr_of(raw, ptr, sizeof ptr);
+                ir("%s = ptrtoint ptr %s to i32", dst, ptr);
+                result.mode = ATTR_REG; result.type = g_addrptr;
+                strncpy(result.reg, dst, sizeof result.reg - 1);
+                break;
+            }
+            case higf:
+                /* HIGH(a): compile-time upper bound of array index type */
+                if (raw.type && raw.type->form == arrays && raw.type->arr.ixp) {
+                    result = make_const_attr(g_cardptr,
+                                            (int32_t)raw.type->arr.ixp->sr.max);
+                } else {
+                    result = make_const_attr(g_cardptr, 0);
+                }
+                break;
+            case sizf:
+                /* SIZE(T or v): byte size of type */
+                result = make_const_attr(g_cardptr, (int32_t)type_bytes(raw.type));
+                break;
+            default: break;
+        }
+        return result;
+    }
+
+    /* VAL(T, x) — first argument is a type name, second is the value */
+    if (fname == valf) {
+        get_symbol(); /* consume lparent */
+        /* First arg: type identifier — read but only use for type annotation */
+        Attr type_arg = expression(); /* namesy of the target type */
+        Stptr target_type = type_arg.type;
+        get_symbol(); /* comma */
+        Attr val_arg = load_attr(expression());
+        /* Emit a type coercion (bitcast/trunc/zext as needed) */
+        char dst[64]; new_reg(dst, sizeof dst);
+        char vbuf[64]; attr_value_str(val_arg, vbuf, sizeof vbuf);
+        char ttbuf[64]; llvm_type(target_type, ttbuf, sizeof ttbuf);
+        char stbuf[64]; llvm_type(val_arg.type, stbuf, sizeof stbuf);
+        if (target_type && val_arg.type && target_type != val_arg.type) {
+            /* Primitive coercion: trunc if narrower, zext if wider, bitcast else */
+            uint32_t dst_sz = type_bytes(target_type);
+            uint32_t src_sz = type_bytes(val_arg.type);
+            if      (dst_sz < src_sz) ir("%s = trunc %s %s to %s", dst, stbuf, vbuf, ttbuf);
+            else if (dst_sz > src_sz) ir("%s = zext %s %s to %s",  dst, stbuf, vbuf, ttbuf);
+            else                       ir("%s = bitcast %s %s to %s", dst, stbuf, vbuf, ttbuf);
+            result.mode = ATTR_REG; result.type = target_type;
+            strncpy(result.reg, dst, sizeof result.reg - 1);
+        } else {
+            result = val_arg; /* same representation */
+        }
+        return result;
+    }
+
+    /* All other standard functions: single loaded argument */
+    get_symbol(); /* consume lparent */
     Attr arg = load_attr(expression());
     char vbuf[64]; attr_value_str(arg, vbuf, sizeof vbuf);
     char dst[64]; new_reg(dst, sizeof dst);
     switch (fname) {
-        case absf:
-            /* ABS(x): x >= 0 ? x : -x; emit select */
-            {
-                char cmp[64]; new_reg(cmp, sizeof cmp);
+        case absf: {
+            /* ABS(x): x >= 0 ? x : -x */
+            char cmp[64]; new_reg(cmp, sizeof cmp);
+            char neg[64]; new_reg(neg, sizeof neg);
+            if (arg.type == g_realptr) {
+                ir("%s = fneg double %s", neg, vbuf);
+                ir("%s = fcmp ogt double %s, 0.0", cmp, vbuf);
+            } else {
                 ir_icmp(cmp, "sge", g_intptr, vbuf, "0");
-                char neg[64]; new_reg(neg, sizeof neg);
                 ir_binop(neg, "sub", g_intptr, "0", vbuf);
-                ir("%s = select i1 %s, i32 %s, i32 %s", dst, cmp, vbuf, neg);
-                result.mode = ATTR_REG; result.type = g_intptr;
-                strncpy(result.reg, dst, sizeof result.reg - 1);
             }
+            ir("%s = select i1 %s, i32 %s, i32 %s", dst, cmp, vbuf, neg);
+            result.mode = ATTR_REG; result.type = arg.type ? arg.type : g_intptr;
+            strncpy(result.reg, dst, sizeof result.reg - 1);
             break;
-        case oddf:
-            ir_icmp(dst, "ne", g_cardptr, vbuf, "0");
-            /* ODD returns BOOLEAN */
-            { char and_dst[64]; new_reg(and_dst, sizeof and_dst);
-              ir("%s = and i32 %s, 1", and_dst, vbuf);
-              ir_icmp(dst, "ne", g_cardptr, and_dst, "0"); }
+        }
+        case oddf: {
+            /* ODD(x): (x AND 1) != 0 */
+            char and_dst[64]; new_reg(and_dst, sizeof and_dst);
+            ir("%s = and i32 %s, 1", and_dst, vbuf);
+            ir_icmp(dst, "ne", g_cardptr, and_dst, "0");
             result.mode = ATTR_REG; result.type = g_boolptr;
             strncpy(result.reg, dst, sizeof result.reg - 1);
             break;
+        }
         case ordf:
-            /* ORD(x): zero-extend to i32 */
-            ir("%s = zext i8 %s to i32", dst, vbuf);
+            /* ORD(x): zero-extend char/bool/enum to i32 */
+            if (arg.type == g_charptr)
+                ir("%s = zext i8 %s to i32", dst, vbuf);
+            else if (arg.type == g_boolptr)
+                ir("%s = zext i1 %s to i32", dst, vbuf);
+            else
+                ir("%s = bitcast i32 %s to i32", dst, vbuf);
             result.mode = ATTR_REG; result.type = g_cardptr;
             strncpy(result.reg, dst, sizeof result.reg - 1);
             break;
@@ -968,19 +1076,32 @@ static Attr call_standard_func(Stfuncs fname, Attr proc_a) {
             strncpy(result.reg, dst, sizeof result.reg - 1);
             break;
         case fltf:
-            /* FLOAT(n): int to double */
+            /* FLOAT(n): integer to double */
             ir("%s = sitofp i32 %s to double", dst, vbuf);
             result.mode = ATTR_REG; result.type = g_realptr;
             strncpy(result.reg, dst, sizeof result.reg - 1);
             break;
         case trcf:
-            /* TRUNC(r): double to int */
+            /* TRUNC(r): double to integer */
             ir("%s = fptosi double %s to i32", dst, vbuf);
             result.mode = ATTR_REG; result.type = g_intptr;
             strncpy(result.reg, dst, sizeof result.reg - 1);
             break;
+        case capf: {
+            /* CAP(c): 'a'..'z' → 'A'..'Z' */
+            char clo[64], chi[64], cin[64], sub[64];
+            new_reg(clo, sizeof clo); new_reg(chi, sizeof chi);
+            new_reg(cin, sizeof cin); new_reg(sub, sizeof sub);
+            ir("%s = icmp sge i8 %s, 97",  clo, vbuf); /* >= 'a' */
+            ir("%s = icmp sle i8 %s, 122", chi, vbuf); /* <= 'z' */
+            ir("%s = and i1 %s, %s",       cin, clo, chi);
+            ir("%s = sub i8 %s, 32",       sub, vbuf);
+            ir("%s = select i1 %s, i8 %s, i8 %s", dst, cin, sub, vbuf);
+            result.mode = ATTR_REG; result.type = g_charptr;
+            strncpy(result.reg, dst, sizeof result.reg - 1);
+            break;
+        }
         default:
-            /* TODO: adrf (ADR), sizf (SIZE), higf (HIGH), capf (CAP), valf (VAL) */
             result = arg;
             break;
     }
@@ -1003,7 +1124,7 @@ static Attr proc_func_call(Attr proc_a) {
             return call_standard_func(ip->proc.fname, proc_a);
     }
 
-    /* Build argument string */
+    /* Build argument string — VAR params pass a pointer, value params pass value */
     char args_buf[2048] = "";
     Idptr param = ip->idtyp ? ip->idtyp->proc.fstparam : NULL;
     int first = 1;
@@ -1011,15 +1132,23 @@ static Attr proc_func_call(Attr proc_a) {
     while (sy != rparent && sy != eop) {
         get_symbol();
         if (sy == rparent) break;
-        Attr arg = load_attr(expression());
-        char vbuf[64];  attr_value_str(arg, vbuf, sizeof vbuf);
-        char tbuf[256]; llvm_type(arg.type, tbuf, sizeof tbuf);
+        int is_var = param && (param->var.vkind == varparam);
+        Attr arg = expression(); /* lvalue Attr from designator */
         if (!first) strncat(args_buf, ", ", sizeof args_buf - strlen(args_buf) - 1);
-        char pair[320]; snprintf(pair, sizeof pair, "%s %s", tbuf, vbuf);
-        strncat(args_buf, pair, sizeof args_buf - strlen(args_buf) - 1);
+        if (is_var) {
+            /* VAR param: pass pointer to the storage location */
+            char ptr[64]; addr_of(arg, ptr, sizeof ptr);
+            char pair[320]; snprintf(pair, sizeof pair, "ptr %s", ptr);
+            strncat(args_buf, pair, sizeof args_buf - strlen(args_buf) - 1);
+        } else {
+            Attr val = load_attr(arg);
+            char vbuf[64];  attr_value_str(val, vbuf, sizeof vbuf);
+            char tbuf[256]; llvm_type(val.type, tbuf, sizeof tbuf);
+            char pair[320]; snprintf(pair, sizeof pair, "%s %s", tbuf, vbuf);
+            strncat(args_buf, pair, sizeof args_buf - strlen(args_buf) - 1);
+        }
         first = 0;
         if (sy == comma) get_symbol();
-        (void)param; /* TODO: use param for VAR-param pass-by-reference */
         param = param ? param->var.vlink : NULL;
     }
     get_symbol(); /* consume rparent */
@@ -1464,11 +1593,21 @@ static void emit_for(void) {
     ir("store i32 %s, ptr %s", hibuf, hi_alloca);
 
     int32_t step = 1;
+    int     step_is_const = 1;
+    char    step_alloca[64] = "";
+
     if (sy == bysy) {
         get_symbol();
-        Attr st = expression();
-        if (st.mode == ATTR_CONST) step = st.cval;
-        /* TODO: non-constant step */
+        Attr st = load_attr(expression());
+        if (st.mode == ATTR_CONST) {
+            step = st.cval;
+        } else {
+            step_is_const = 0;
+            snprintf(step_alloca, sizeof step_alloca, "%%for_step_%u", lbl_ctr++);
+            fprintf(ll_out, "  %s = alloca i32\n", step_alloca);
+            char stv[64]; attr_value_str(st, stv, sizeof stv);
+            ir("store i32 %s, ptr %s", stv, step_alloca);
+        }
     }
 
     char cond_lbl[32], body_lbl[32], exit_lbl[32];
@@ -1481,18 +1620,39 @@ static void emit_for(void) {
     char cur[64]; new_reg(cur, sizeof cur);
     ir_load(cur, ctrl.type, ctrl_ptr);
     char hiv[64]; new_reg(hiv, sizeof hiv);
-    ir("  %s = load i32, ptr %s", hiv, hi_alloca);
+    ir("%s = load i32, ptr %s", hiv, hi_alloca);
     char cmp[64]; new_reg(cmp, sizeof cmp);
-    const char* pred = (step > 0) ? "sle" : "sge";
-    ir_icmp(cmp, pred, g_intptr, cur, hiv);
+
+    if (step_is_const) {
+        const char* pred = (step >= 0) ? "sle" : "sge";
+        ir_icmp(cmp, pred, g_intptr, cur, hiv);
+    } else {
+        /* Runtime step: select sle or sge based on step sign */
+        char step_v[64]; new_reg(step_v, sizeof step_v);
+        ir("%s = load i32, ptr %s", step_v, step_alloca);
+        char sgt0[64], cle[64], cge[64];
+        new_reg(sgt0, sizeof sgt0);
+        new_reg(cle,  sizeof cle);
+        new_reg(cge,  sizeof cge);
+        ir("%s = icmp sgt i32 %s, 0", sgt0, step_v);
+        ir_icmp(cle, "sle", g_intptr, cur, hiv);
+        ir_icmp(cge, "sge", g_intptr, cur, hiv);
+        ir("%s = select i1 %s, i1 %s, i1 %s", cmp, sgt0, cle, cge);
+    }
     ir_condbr(cmp, body_lbl, exit_lbl);
 
     ir_label(body_lbl);
     stat_seq(endsy);
-    /* Increment (or decrement) control variable by the actual step value */
+    /* Increment control variable by step */
     char inc[64]; new_reg(inc, sizeof inc);
-    char step_str[32]; snprintf(step_str, sizeof step_str, "%d", step);
-    ir_binop(inc, "add", ctrl.type, cur, step_str);
+    if (step_is_const) {
+        char step_str[32]; snprintf(step_str, sizeof step_str, "%d", step);
+        ir_binop(inc, "add", ctrl.type, cur, step_str);
+    } else {
+        char step_v[64]; new_reg(step_v, sizeof step_v);
+        ir("%s = load i32, ptr %s", step_v, step_alloca);
+        ir_binop(inc, "add", ctrl.type, cur, step_v);
+    }
     ir_store(ctrl.type, inc, ctrl_ptr);
     if (!unreachable) ir_br(cond_lbl);
 
@@ -1520,80 +1680,79 @@ static void emit_loop(void) {
 }
 
 static void emit_case(void) {
+    /* CASE sel OF arm1 | arm2 | ... [ELSE body] END
+     *
+     * Single-pass comparison-chain: for each arm emit icmp/condbr checks
+     * that branch to the arm body on match or fall through to the next arm.
+     * Each check label is forward-declared; LLVM resolves at function end. */
     Attr sel = load_attr(expression());
     char sbuf[64]; attr_value_str(sel, sbuf, sizeof sbuf);
-    get_symbol(); /* ofsy */
+    get_symbol(); /* ofsy — the "OF" keyword */
 
-    char else_lbl[32], end_lbl[32];
-    new_label(else_lbl, sizeof else_lbl);
-    new_label(end_lbl,  sizeof end_lbl);
+    char end_lbl[32]; new_label(end_lbl, sizeof end_lbl);
 
-    /* Collect (value, label) pairs before emitting switch */
-    typedef struct { int32_t v; char lbl[32]; } CaseArm;
-    CaseArm arms[256]; int narms = 0;
-    char arm_save_pos = 0; /* not used; we buffer in arms[] */
+    /* Single-pass comparison-chain approach:
+     * For each arm, emit icmp/condbr checks before the arm body.
+     * Each failed check falls through to the next arm's checks.
+     * No forward-reference buffering needed. */
+    for (;;) {
+        if (sy == endsy || sy == eop) break;
 
-    /* First pass: parse arms, assign labels, emit arm bodies later */
-    /* We emit the switch stub, then arm bodies, then fill table */
+        if (sy == elsesy) {
+            get_symbol();
+            stat_seq(endsy);
+            if (!unreachable) ir_br(end_lbl);
+            break;
+        }
 
-    /* Emit switch with a forward-declared table */
-    /* LLVM IR allows forward label references in switch */
-    /* Strategy: emit all arm bodies after reserving their labels */
-    char switch_buf[4096];
-    int  switch_len = 0;
-    switch_len += snprintf(switch_buf + switch_len,
-                           sizeof switch_buf - switch_len,
-                           "  switch i32 %s, label %%%s [\n", sbuf, else_lbl);
-
-    while (sy == ofsy) {
-        get_symbol(); /* consume ofsy or move to first case label */
+        /* sy is the first anycon token of the current arm's label list */
         char arm_lbl[32]; new_label(arm_lbl, sizeof arm_lbl);
 
-        /* Parse case label list: val1 | val1..val2 : */
-        while (sy != colon) {
-            int32_t lo_v = val; get_symbol();
+        /* Emit comparison chain; each failed check jumps to the next check */
+        while (sy != colon && sy != eop) {
+            int32_t lo_v = (int32_t)val;
+            get_symbol();           /* advance past lo anycon */
             int32_t hi_v = lo_v;
-            if (sy == range) { get_symbol(); hi_v = val; get_symbol(); }
-            for (int32_t v = lo_v; v <= hi_v && narms < 256; v++) {
-                arms[narms].v = v;
-                strncpy(arms[narms].lbl, arm_lbl, sizeof arms[narms].lbl);
-                narms++;
-                switch_len += snprintf(switch_buf + switch_len,
-                                       sizeof switch_buf - switch_len,
-                                       "    i32 %d, label %%%s\n", v, arm_lbl);
+            if (sy == range) {
+                get_symbol();       /* skip range token */
+                hi_v = (int32_t)val;
+                get_symbol();       /* advance past hi anycon */
             }
             if (sy == comma) get_symbol();
+
+            char chk_next[32]; new_label(chk_next, sizeof chk_next);
+            if (lo_v == hi_v) {
+                char cmp[64]; new_reg(cmp, sizeof cmp);
+                ir("%s = icmp eq i32 %s, %d", cmp, sbuf, lo_v);
+                ir_condbr(cmp, arm_lbl, chk_next);
+            } else {
+                char clo[64], chi[64], cin[64];
+                new_reg(clo, sizeof clo);
+                new_reg(chi, sizeof chi);
+                new_reg(cin, sizeof cin);
+                ir("%s = icmp sle i32 %d, %s", clo, lo_v, sbuf);
+                ir("%s = icmp sle i32 %s, %d", chi, sbuf, hi_v);
+                ir("%s = and i1 %s, %s",       cin, clo, chi);
+                ir_condbr(cin, arm_lbl, chk_next);
+            }
+            ir_label(chk_next);
         }
+
+        /* No label matched — fall through to next arm or else/trap */
+        char no_match[32]; new_label(no_match, sizeof no_match);
+        ir_br(no_match);
+
         get_symbol(); /* colon */
 
-        /* Emit arm body */
-        /* (We emit after switch stub — forward refs are fine in textual IR) */
-        /* Temporarily save then restore unreachable */
-        int saved = unreachable;
-        /* We output arm body inline — this works because LLVM parser
-           resolves labels independently of textual order. */
-        fprintf(ll_out, "%s", switch_buf); /* flush switch stub */
-        switch_len = 0; switch_buf[0] = '\0';
-        fprintf(ll_out, "  ]\n");  /* close switch table */
-        /* Reset so we can emit the arm */
-        unreachable = 0;
         ir_label(arm_lbl);
         stat_seq3(ofsy, elsesy, endsy);
         if (!unreachable) ir_br(end_lbl);
-        unreachable = saved;
-        /* Only first arm closes the switch; subsequent arms aren't re-emitted */
-        /* TODO: proper multi-arm buffering */
-        break; /* simplified: handle first arm only in this stub */
+
+        ir_label(no_match);
+        if (sy == ofsy) get_symbol(); /* consume | arm separator */
     }
 
-    if (sy == elsesy) {
-        get_symbol();
-        ir_label(else_lbl);
-        stat_seq(endsy);
-        if (!unreachable) ir_br(end_lbl);
-    } else {
-        ir_label(else_lbl);
-        /* Range error trap */
+    if (sy != endsy && sy != eop) {
         ir_call_void("@M2_Trap", "i32 4");
         ir_br(end_lbl);
     }
@@ -1712,7 +1871,7 @@ static void emit_module_globals(Idptr mod) {
     Idptr vp = mod->proc.globvarp;
     while (vp) {
         char gname[128];
-        mangle_module_var(mod->proc.identifier, "v", gname, sizeof gname);
+        mangle_var_id(vp, gname, sizeof gname);
         char tbuf[256]; llvm_type(vp->idtyp, tbuf, sizeof tbuf);
         fprintf(ll_out, "%s = global %s zeroinitializer\n", gname, tbuf);
         vp = vp->var.vlink;
